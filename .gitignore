@@ -1,2 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
 venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
 .env
+.env.*
+!.env.example
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs & Temporary Files
+*.log
+logs/
+tmp/
+*.wav
+*.mp3
+*.pcm
+*.raw
+
+# Testing & Coverage
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover

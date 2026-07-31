@@ -10,14 +10,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-class Config:
-    """
-    Application configuration.
 
-    Usage:
-        from config import config
-        print(config.deepgram_api_key)
-    """
+class Config:
+    """Application configuration."""
+
     # ─── Twilio ───
     twilio_account_sid: str = os.getenv("TWILIO_ACCOUNT_SID", "")
     twilio_auth_token: str = os.getenv("TWILIO_AUTH_TOKEN", "")
@@ -26,10 +22,9 @@ class Config:
     # ─── Deepgram (STT) ───
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
 
-    # ─── AWS Bedrock (LLM) ───
-    aws_region: str = os.getenv("AWS_REGION", "us-east-1")
-    aws_access_key_id: str = os.getenv("AWS_ACCESS_KEY_ID", "")
-    aws_secret_access_key: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    # ─── Bedrock Mantle (LLM) — OpenAI-compatible ───
+    bedrock_base_url: str = os.getenv("BEDROCK_BASE_URL", "")
+    bedrock_api_key: str = os.getenv("BEDROCK_API_KEY", "")
     bedrock_model_id: str = os.getenv(
         "BEDROCK_MODEL_ID",
         "anthropic.claude-3-haiku-20240307-v1:0",
@@ -38,6 +33,9 @@ class Config:
     # ─── Cartesia (TTS) ───
     cartesia_api_key: str = os.getenv("CARTESIA_API_KEY", "")
     cartesia_voice_id: str = os.getenv("CARTESIA_VOICE_ID", "")
+
+    # ─── Redis ───
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     # ─── Server ───
     server_host: str = os.getenv("SERVER_HOST", "localhost:8000")
@@ -50,8 +48,10 @@ class Config:
     llm_temperature: float = 0.7
     stt_endpointing_ms: int = 500
     greeting_text: str = "Hello! Thanks for calling Acme Corp. How can I help you today?"
+    max_tool_calls_per_turn: int = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "5"))
+    knowledge_base_path: str = os.getenv("KNOWLEDGE_BASE_PATH", "./knowledge.json")
 
-    # ─── Available Bedrock Models ───
+    # ─── Available Models (via Bedrock Mantle) ───
     AVAILABLE_MODELS = {
         "haiku": "anthropic.claude-3-haiku-20240307-v1:0",
         "sonnet": "anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -72,10 +72,10 @@ class Config:
             missing.append("TWILIO_PHONE_NUMBER")
         if not self.deepgram_api_key:
             missing.append("DEEPGRAM_API_KEY")
-        if not self.aws_access_key_id:
-            missing.append("AWS_ACCESS_KEY_ID")
-        if not self.aws_secret_access_key:
-            missing.append("AWS_SECRET_ACCESS_KEY")
+        if not self.bedrock_base_url:
+            missing.append("BEDROCK_BASE_URL")
+        if not self.bedrock_api_key:
+            missing.append("BEDROCK_API_KEY")
         if not self.cartesia_api_key:
             missing.append("CARTESIA_API_KEY")
         if not self.cartesia_voice_id:
@@ -88,5 +88,4 @@ class Config:
         return len(self.validate()) == 0
 
 
-# Singleton instance
 config = Config()
