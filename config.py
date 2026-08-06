@@ -14,10 +14,16 @@ load_dotenv()
 class Config:
     """Application configuration."""
 
-    # ─── Twilio ───
-    twilio_account_sid: str = os.getenv("TWILIO_ACCOUNT_SID", "")
-    twilio_auth_token: str = os.getenv("TWILIO_AUTH_TOKEN", "")
-    twilio_phone_number: str = os.getenv("TWILIO_PHONE_NUMBER", "")
+    # ─── SignalWire ───
+    signalwire_project_id: str = os.getenv("SIGNALWIRE_PROJECT_ID", "")
+    signalwire_api_token: str = os.getenv("SIGNALWIRE_API_TOKEN", "")
+    signalwire_space_url: str = os.getenv("SIGNALWIRE_SPACE_URL", "")
+    signalwire_phone_number: str = os.getenv("SIGNALWIRE_PHONE_NUMBER", "")
+
+    # Legacy alias fallback support
+    twilio_account_sid: str = os.getenv("TWILIO_ACCOUNT_SID", "") or os.getenv("SIGNALWIRE_PROJECT_ID", "")
+    twilio_auth_token: str = os.getenv("TWILIO_AUTH_TOKEN", "") or os.getenv("SIGNALWIRE_API_TOKEN", "")
+    twilio_phone_number: str = os.getenv("TWILIO_PHONE_NUMBER", "") or os.getenv("SIGNALWIRE_PHONE_NUMBER", "")
 
     # ─── Deepgram (STT) ───
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
@@ -51,6 +57,19 @@ class Config:
     max_tool_calls_per_turn: int = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "5"))
     knowledge_base_path: str = os.getenv("KNOWLEDGE_BASE_PATH", "./knowledge.json")
 
+    def get_signalwire_client(self):
+        """Construct a SignalWire REST Client instance."""
+        from signalwire.rest import Client as SignalWireClient
+        return SignalWireClient(
+            self.signalwire_project_id,
+            self.signalwire_api_token,
+            signalwire_space_url=self.signalwire_space_url,
+        )
+
+    def get_twilio_client(self):
+        """Compatibility wrapper for SignalWire Client."""
+        return self.get_signalwire_client()
+
     # ─── Available Models (via Bedrock Mantle) ───
     AVAILABLE_MODELS = {
         "haiku": "anthropic.claude-3-haiku-20240307-v1:0",
@@ -64,12 +83,14 @@ class Config:
         """Validate configuration and return list of missing keys."""
         missing = []
 
-        if not self.twilio_account_sid:
-            missing.append("TWILIO_ACCOUNT_SID")
-        if not self.twilio_auth_token:
-            missing.append("TWILIO_AUTH_TOKEN")
-        if not self.twilio_phone_number:
-            missing.append("TWILIO_PHONE_NUMBER")
+        if not self.signalwire_project_id:
+            missing.append("SIGNALWIRE_PROJECT_ID")
+        if not self.signalwire_api_token:
+            missing.append("SIGNALWIRE_API_TOKEN")
+        if not self.signalwire_space_url:
+            missing.append("SIGNALWIRE_SPACE_URL")
+        if not self.signalwire_phone_number:
+            missing.append("SIGNALWIRE_PHONE_NUMBER")
         if not self.deepgram_api_key:
             missing.append("DEEPGRAM_API_KEY")
         if not self.bedrock_base_url:

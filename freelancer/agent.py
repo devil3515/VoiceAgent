@@ -1,13 +1,7 @@
 """
-Voice Agent — orchestrates the full call pipeline with tools.
+Freelancer Voice Agent — outbound calls on behalf of a freelancer.
 
-STT (Deepgram) → LLM (Bedrock Mantle) → [Tool Execution] → TTS (Cartesia)
-
-Key Phase 2 additions:
-- Tool execution loop (LLM can call tools, get results, continue)
-- Session state management
-- Knowledge base integration
-- Outbound call support
+Same audio pipeline as clinic agent, different prompts + tools.
 """
 
 import asyncio
@@ -24,9 +18,10 @@ from services.audio_utils import (
     chunk_audio,
     encode_twilio_payload,
 )
-from agents.prompts import SYSTEM_PROMPT, GREETING_TEXT, CLARIFICATION_TEXTS
+from freelancer.profile import FreelancerProfile
+from freelancer.prompts import build_freelancer_prompt, GREETING_TEMPLATE, WRAP_UP
+from freelancer.tools import get_freelancer_tool_definitions, get_freelancer_tool_map
 from agents.conversation import ConversationManager
-from agents.tools import execute_tool, get_tool_definitions
 from memory.session import SessionManager
 from config import config
 from utils.logging import get_logger
@@ -34,34 +29,37 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-class VoiceAgent:
+class FreelancerVoiceAgent:
     """
-    Handles a single voice call with tool support.
-    
-    Lifecycle:
-        1. Twilio opens WebSocket → agent.run()
-        2. Agent connects STT, sends greeting
-        3. Loop: receive audio → transcribe → LLM (with tools) → speak
-        4. Tool execution loop if LLM requests tools
-        5. Twilio closes WebSocket → agent cleans up
+    Voice agent for outbound calls on behalf of a freelancer.
+
+    Usage:
+        agent = FreelancerVoiceAgent(twilio_ws=ws, profile=profile)
+        await agent.run()
     """
 
-    def __init__(self, twilio_ws):
+    def __init__(self, twilio_ws, profile: FreelancerProfile, lead_info: Optional[dict] = None):
         self.twilio_ws = twilio_ws
+        self.profile = profile
+        self.lead_info = lead_info or {}
         self.stream_sid: Optional[str] = None
         self.call_sid: Optional[str] = None
 
-        # Services
         self.stt: Optional[DeepgramSTTService] = None
         self.llm: Optional[BedrockLLMService] = None
         self.tts: Optional[CartesiaTTSService] = None
 
-        # Conversation & Session
+        # Build prompt from profile
+        system_prompt = build_freelancer_prompt(profile)
         self.conversation = ConversationManager(
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             max_history=config.max_conversation_history,
         )
         self.session: Optional[SessionManager] = None
+
+        # Tools
+        self.tool_definitions = get_freelancer_tool_definitions()
+        self.tool_map = get_freelancer_tool_map(profile)
 
         # State
         self.current_transcript = ""
@@ -69,24 +67,25 @@ class VoiceAgent:
         self.is_agent_speaking = False
         self.turn_count = 0
         self.call_start_time: Optional[float] = None
-        self.tool_definitions = get_tool_definitions()
+        self.call_ended = False
 
     # ─────────────────────────────────────────────
     # MAIN ENTRY POINT
     # ─────────────────────────────────────────────
 
     async def run(self):
-        """Main entry point. Handles the full call lifecycle."""
-        logger.info("agent_call_starting")
+        """Handle the full call lifecycle."""
+        logger.info(
+            "freelancer_agent_call_starting",
+            freelancer=self.profile.name,
+            lead=self.lead_info,
+        )
         self.call_start_time = time.time()
 
         try:
             self._init_services()
-
-            # Initialize session
             self.session = SessionManager(call_sid="pending")
 
-            # Connect STT
             connected = await self.stt.connect(
                 on_transcript=self._on_transcript,
                 on_error=self._on_stt_error,
@@ -95,35 +94,33 @@ class VoiceAgent:
             )
 
             if not connected:
-                logger.error("agent_stt_connection_failed")
+                logger.error("freelancer_agent_stt_connection_failed")
                 return
 
-            # Send greeting
             await self._send_greeting()
 
-            # Process Twilio audio stream
             async for raw_message in self.twilio_ws.iter_text():
+                if self.call_ended:
+                    break
                 try:
                     data = json.loads(raw_message)
                     await self._handle_twilio_event(data)
                 except json.JSONDecodeError:
-                    logger.warning("agent_invalid_json")
+                    pass
                 except Exception as e:
-                    logger.error("agent_message_error", error=str(e))
+                    logger.error("freelancer_agent_message_error", error=str(e))
 
         except Exception as e:
-            logger.error("agent_call_error", error=str(e), error_type=type(e).__name__)
+            logger.error("freelancer_agent_call_error", error=str(e))
         finally:
             await self._cleanup()
 
     # ─────────────────────────────────────────────
-    # SERVICE INITIALIZATION
+    # SERVICE INIT
     # ─────────────────────────────────────────────
 
     def _init_services(self):
-        """Initialize all pipeline services."""
         self.stt = DeepgramSTTService(api_key=config.deepgram_api_key)
-
         self.llm = BedrockLLMService(
             base_url=config.bedrock_base_url,
             api_key=config.bedrock_api_key,
@@ -131,330 +128,214 @@ class VoiceAgent:
             max_tokens=config.llm_max_tokens,
             temperature=config.llm_temperature,
         )
-
         self.tts = CartesiaTTSService(
             api_key=config.cartesia_api_key,
             voice_id=config.cartesia_voice_id,
         )
 
-        logger.info(
-            "agent_services_initialized",
-            stt="deepgram",
-            llm="bedrock_mantle",
-            tts="cartesia",
-            model=config.bedrock_model_id,
-            tools=[t["function"]["name"] for t in self.tool_definitions],
-        )
-
     # ─────────────────────────────────────────────
-    # TWILIO EVENT HANDLING
+    # TWILIO EVENTS
     # ─────────────────────────────────────────────
 
     async def _handle_twilio_event(self, data: dict):
-        """Route incoming Twilio WebSocket events."""
         event = data.get("event")
-
         if event == "connected":
-            logger.info("agent_twilio_connected")
-
+            logger.info("freelancer_twilio_connected")
         elif event == "start":
             self.stream_sid = data["start"]["streamSid"]
             self.call_sid = data["start"].get("callSid", "unknown")
-            # Update session with real call_sid
             if self.session:
                 self.session.call_id = self.call_sid
-            logger.info("agent_call_started", call_sid=self.call_sid)
-
+            logger.info("freelancer_call_started", call_sid=self.call_sid)
         elif event == "media":
-            payload = data["media"]["payload"]
-            await self._process_incoming_audio(payload)
-
+            await self._process_incoming_audio(data["media"]["payload"])
         elif event == "stop":
-            logger.info("agent_call_stopped", call_sid=self.call_sid)
+            logger.info("freelancer_call_stopped", call_sid=self.call_sid)
 
     async def _process_incoming_audio(self, base64_mulaw: str):
-        """Convert Twilio audio and send to Deepgram."""
         try:
             pcm_16k = twilio_to_deepgram(base64_mulaw)
             if self.stt and self.stt.is_connected:
                 await self.stt.send_audio(pcm_16k)
         except Exception as e:
-            logger.error("agent_audio_processing_error", error=str(e))
+            logger.error("freelancer_audio_error", error=str(e))
 
     # ─────────────────────────────────────────────
     # STT CALLBACKS
     # ─────────────────────────────────────────────
 
     async def _on_transcript(self, result, **kwargs):
-        """Handle Deepgram transcription results."""
         try:
             transcript = result.channel.alternatives[0].transcript
             if not transcript:
                 return
-
             if result.is_final:
                 self.current_transcript += transcript + " "
-
             if result.speech_final and self.current_transcript.strip():
                 user_text = self.current_transcript.strip()
                 self.current_transcript = ""
-
                 if not self.is_processing:
                     asyncio.create_task(self._process_turn(user_text))
-                else:
-                    logger.warning(
-                        "agent_skipping_turn",
-                        reason="still_processing",
-                        text=user_text[:50],
-                    )
-
         except Exception as e:
-            logger.error("agent_transcript_error", error=str(e))
+            logger.error("freelancer_transcript_error", error=str(e))
 
     async def _on_stt_error(self, error, **kwargs):
-        logger.error("agent_stt_error", error=str(error))
+        logger.error("freelancer_stt_error", error=str(error))
 
     async def _on_stt_close(self, close, **kwargs):
-        logger.info("agent_stt_closed")
+        logger.info("freelancer_stt_closed")
 
     # ─────────────────────────────────────────────
-    # FULL TURN PROCESSING (with tool execution loop)
+    # TURN PROCESSING WITH TOOLS
     # ─────────────────────────────────────────────
 
     async def _process_turn(self, user_text: str):
-        """
-        Process a complete user utterance with tool support.
-        
-        Flow:
-        1. Add user message to conversation
-        2. Call LLM (with tools available)
-        3. If LLM returns tool calls → execute tools → call LLM again
-        4. If LLM returns text → generate TTS → speak
-        5. Repeat until LLM returns text (or max tool calls reached)
-        """
+        """Process a turn with the tool execution loop."""
         self.is_processing = True
         self.turn_count += 1
         turn_start = time.time()
 
-        logger.info("agent_turn_start", turn=self.turn_count, user_text=user_text)
+        logger.info("freelancer_turn_start", turn=self.turn_count, user_text=user_text)
 
         try:
-            # Step 1: Add user message
             self.conversation.add_user_message(user_text)
-
-            # Step 2: Tool execution loop
             max_iterations = config.max_tool_calls_per_turn
             agent_text = None
 
             for iteration in range(max_iterations):
-                # Get current messages
                 messages = self.conversation.get_messages()
-
-                # Call LLM with tools
                 llm_response = await self.llm.generate(
                     messages=messages,
                     tools=self.tool_definitions,
                     tool_choice="auto",
                 )
 
-                # ─── LLM wants to call tools ───
                 if llm_response.has_tool_calls:
-                    # Add assistant tool call message to conversation
-                    self.conversation.add_assistant_tool_calls(
-                        llm_response.tool_calls
-                    )
+                    self.conversation.add_assistant_tool_calls(llm_response.tool_calls)
 
-                    # Execute each tool call
                     for tool_call in llm_response.tool_calls:
                         tool_name = tool_call["name"]
                         tool_args = tool_call["arguments"]
                         tool_id = tool_call["id"]
 
-                        logger.info(
-                            "agent_executing_tool",
-                            iteration=iteration,
-                            tool_name=tool_name,
-                            tool_args=tool_args,
-                        )
+                        logger.info("freelancer_executing_tool", tool_name=tool_name, tool_args=tool_args)
 
-                        # Execute the tool
-                        result = await execute_tool(
-                            tool_name=tool_name,
-                            arguments=tool_args,
-                            call_sid=self.call_sid,
-                        )
+                        tool_func = self.tool_map.get(tool_name)
+                        if tool_func:
+                            try:
+                                result = await tool_func(**tool_args)
+                            except Exception as e:
+                                result = f"Error: {str(e)}"
+                        else:
+                            result = f"Unknown tool: {tool_name}"
 
-                        # Add tool result to conversation
-                        self.conversation.add_tool_result(
-                            tool_call_id=tool_id,
-                            result=result,
-                        )
+                        self.conversation.add_tool_result(tool_call_id=tool_id, result=result)
 
-                        # Store in session for reference
-                        if self.session:
-                            await self.session.set(
-                                f"last_tool_{tool_name}",
-                                {"args": tool_args, "result": result},
-                            )
-
-                        # Check if this is a transfer request
-                        if tool_name == "transfer_call" and "TRANSFER_REQUESTED" in result:
+                        if "TRANSFER_REQUESTED" in result:
                             agent_text = result.replace("TRANSFER_REQUESTED: ", "")
                             break
+                        if "CALL_END" in result:
+                            agent_text = WRAP_UP
+                            self.call_ended = True
+                            break
 
-                    # If transfer was requested, break out of the loop
                     if agent_text:
                         break
-
-                    # Continue the loop — LLM will get tool results and respond
                     continue
 
-                # ─── LLM returned text ───
                 elif llm_response.has_content:
                     agent_text = llm_response.content
                     self.conversation.add_assistant_message(agent_text)
                     break
-
-                # ─── LLM returned neither (shouldn't happen) ───
                 else:
-                    logger.warning("agent_empty_llm_response", iteration=iteration)
-                    agent_text = "I'm sorry, could you say that again?"
+                    agent_text = "Could you repeat that?"
                     break
 
-            # Fallback if we hit max iterations
             if agent_text is None:
-                agent_text = "I'm working on that. Let me transfer you to someone who can help."
-                logger.warning("agent_max_tool_iterations", max_iterations=max_iterations)
+                agent_text = WRAP_UP
 
-            # Step 3: Generate TTS and speak
             await self._speak(agent_text)
 
             total_latency = (time.time() - turn_start) * 1000
-
             logger.info(
-                "agent_turn_complete",
+                "freelancer_turn_complete",
                 turn=self.turn_count,
-                user_text=user_text,
-                agent_text=agent_text,
                 total_latency_ms=round(total_latency, 1),
             )
 
-            # Save transcript to session
-            if self.session:
-                await self.session.set(
-                    "last_turn",
-                    {
-                        "user": user_text,
-                        "agent": agent_text,
-                        "latency_ms": round(total_latency, 1),
-                    },
-                )
-
         except Exception as e:
-            logger.error(
-                "agent_turn_error",
-                turn=self.turn_count,
-                error=str(e),
-                error_type=type(e).__name__,
-            )
-            # Speak a fallback message
-            try:
-                await self._speak("I'm sorry, I ran into an issue. Could you try again?")
-            except Exception:
-                pass
-
+            logger.error("freelancer_turn_error", error=str(e))
         finally:
             self.is_processing = False
 
     # ─────────────────────────────────────────────
-    # SPEAK (TTS + Send to Twilio)
+    # SPEAK / AUDIO
     # ─────────────────────────────────────────────
 
     async def _speak(self, text: str):
-        """
-        Convert text to speech and send to Twilio.
-        
-        Args:
-            text: Text to speak
-        """
         try:
             audio_data = await self.tts.synthesize(text)
             await self._send_audio_to_twilio(audio_data)
         except Exception as e:
-            logger.error("agent_speak_error", error=str(e), text=text[:100])
-
-    # ─────────────────────────────────────────────
-    # SEND AUDIO TO TWILIO
-    # ─────────────────────────────────────────────
+            logger.error("freelancer_speak_error", error=str(e))
 
     async def _send_audio_to_twilio(self, pcm_16k: bytes):
-        """Convert PCM audio to Twilio format and send in chunks."""
         mulaw_audio = linear16_to_mulaw(pcm_16k)
         chunks = chunk_audio(mulaw_audio, chunk_size=800)
-
         self.is_agent_speaking = True
 
         for chunk in chunks:
             if not self.is_agent_speaking:
                 break
-
             payload = encode_twilio_payload(chunk)
-
             message = {
                 "event": "media",
                 "streamSid": self.stream_sid,
                 "media": {"payload": payload},
             }
-
             try:
                 await self.twilio_ws.send_text(json.dumps(message))
             except Exception as e:
-                logger.error("agent_audio_send_error", error=str(e))
+                logger.error("freelancer_audio_send_error", error=str(e))
                 break
-
             await asyncio.sleep(0.02)
 
         self.is_agent_speaking = False
 
-    # ─────────────────────────────────────────────
-    # GREETING
-    # ─────────────────────────────────────────────
-
     async def _send_greeting(self):
-        """Send an initial greeting when the call starts."""
-        logger.info("agent_sending_greeting", greeting=GREETING_TEXT)
-        await self._speak(GREETING_TEXT)
+        greeting = GREETING_TEMPLATE.format(name=self.profile.name)
+        logger.info("freelancer_greeting", greeting=greeting)
+        await self._speak(greeting)
 
     # ─────────────────────────────────────────────
     # CLEANUP
     # ─────────────────────────────────────────────
 
     async def _cleanup(self):
-        """Clean up resources when the call ends."""
         if self.call_start_time:
             duration = time.time() - self.call_start_time
             logger.info(
-                "agent_call_ended",
+                "freelancer_call_ended",
                 call_sid=self.call_sid,
                 duration_seconds=round(duration, 1),
                 total_turns=self.turn_count,
-                total_messages=self.conversation.message_count,
             )
 
         if self.stt:
             await self.stt.disconnect()
 
-        # Save final transcript to session
-        if self.session:
-            await self.session.set(
-                "call_summary",
-                {
-                    "call_sid": self.call_sid,
-                    "duration_seconds": round(time.time() - self.call_start_time, 1) if self.call_start_time else 0,
-                    "total_turns": self.turn_count,
-                    "transcript": self.conversation.get_transcript(),
-                },
-            )
+        # Auto follow-up email
+        if self.profile.follow_up_email and self.lead_info.get("email"):
+            try:
+                from tools.email_followup import send_followup_email
+                await send_followup_email(
+                    profile=self.profile,
+                    email=self.lead_info["email"],
+                    name=self.lead_info.get("name", "there"),
+                    summary=self.conversation.get_transcript()[:500],
+                )
+            except Exception as e:
+                logger.error("freelancer_followup_email_error", error=str(e))
 
         self.is_agent_speaking = False
         self.is_processing = False
