@@ -19,6 +19,52 @@ import sys
 import structlog
 
 
+def _dashboard_mirror_processor(logger, method_name, event_dict):
+    """
+    structlog processor that mirrors every log record into the dashboard bus.
+
+    Imports lazily to avoid a circular import at module load time.
+    The bus is best-effort: if it's not configured yet, we silently drop.
+    """
+    try:
+        from dashboard_bus import bus as _bus
+    except Exception:
+        return event_dict
+    try:
+        _bus.publish(
+            event=event_dict.get("event", method_name),
+            level=event_dict.get("level"),
+            logger=event_dict.get("logger"),
+            **{
+                k: v
+                for k, v in event_dict.items()
+                if k not in {"event", "level", "logger", "timestamp", "_record"}
+            },
+        )
+    except Exception:
+        # Never let the bus break logging.
+        pass
+    return event_dict
+
+
+# The structlog chain must end with `wrap_for_formatter` when routing through
+# stdlib. The stdlib handler's `ProcessorFormatter` (configured below) then
+# runs the *final* `JSONRenderer` exactly once. Ending the chain with
+# `JSONRenderer` here would cause the formatter to render a second time, which
+# nests the JSON output as a string under the `event` key.
+_STRUCTLOG_PROCESSORS = [
+    structlog.contextvars.merge_contextvars,
+    structlog.stdlib.add_log_level,
+    structlog.stdlib.add_logger_name,
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.processors.StackInfoRenderer(),
+    structlog.processors.format_exc_info,
+    structlog.processors.UnicodeDecoder(),
+    _dashboard_mirror_processor,
+    structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+]
+
+
 def setup_logging(log_level: str = "INFO"):
     """
     Configure structured JSON logging.
@@ -28,18 +74,8 @@ def setup_logging(log_level: str = "INFO"):
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
     """
-    # Configure structlog
     structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.add_logger_name,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.UnicodeDecoder(),
-            structlog.processors.JSONRenderer(),  # JSON output
-        ],
+        processors=_STRUCTLOG_PROCESSORS,
         wrapper_class=structlog.stdlib.BoundLogger,
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,

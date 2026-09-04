@@ -1,15 +1,15 @@
 """
-Bedrock Mantle LLM Service — OpenAI-compatible.
+LLM Service — OpenAI-compatible.
 
-Uses the OpenAI SDK pointed at a Bedrock Mantle endpoint.
+Uses the OpenAI SDK pointed at any OpenAI-compatible chat-completions endpoint.
 This gives us:
 - Native async (no thread pool needed)
 - Standard OpenAI message format
 - Built-in streaming support
-- Same SDK you'd use for GPT, just different base_url
 
-Compatible with any OpenAI-style API:
-- AWS Bedrock Mantle
+Works with any OpenAI-compatible provider by setting `LLM_BASE_URL`:
+- OpenRouter        (https://openrouter.ai/api/v1)
+- AWS Bedrock Mantle (any OpenAI-compatible Mantle endpoint)
 - vLLM
 - LiteLLM
 - Ollama
@@ -73,13 +73,12 @@ class ToolCall:
 
 
 
-
-class BedrockLLMService:
+class LLMService:
     """
-    LLM service using Bedrock Mantle (OpenAI-compatible API).
+    LLM service using any OpenAI-compatible API.
 
     Usage:
-        llm = BedrockLLMService(base_url="...", api_key="...", model_id="...")
+        llm = LLMService(base_url="...", api_key="...", model_id="...")
 
         # Without tools
         response = await llm.generate(messages)
@@ -94,19 +93,19 @@ class BedrockLLMService:
         self,
         base_url: str,
         api_key: str,
-        model_id: str = "anthropic.claude-3-haiku-20240307-v1:0",
+        model_id: str = "anthropic/claude-3-haiku",
         max_tokens: int = 150,
         temperature: float = 0.7,
         top_p: float = 0.9,
         timeout: float = 30.0,
     ):
         """
-        Initialize Bedrock Mantle LLM service.
+        Initialize the LLM service.
 
         Args:
-            base_url: Mantle endpoint URL (e.g., "https://mantle.example.com/v1")
-            api_key: API key for the Mantle endpoint
-            model_id: Bedrock model ID to use
+            base_url: OpenAI-compatible endpoint URL (e.g. "https://openrouter.ai/api/v1")
+            api_key: API key for the endpoint
+            model_id: Model identifier understood by the provider
             max_tokens: Maximum tokens in response
             temperature: Response temperature (0.0 - 1.0)
             top_p: Top-p sampling parameter
@@ -117,7 +116,7 @@ class BedrockLLMService:
         self.temperature = temperature
         self.top_p = top_p
 
-        # Create OpenAI client pointed at Bedrock Mantle
+        # Create OpenAI client pointed at the configured endpoint
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,

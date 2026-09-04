@@ -54,17 +54,19 @@ def mulaw_to_linear16(mulaw_bytes: bytes) -> bytes:
 
 
 def decode_twilio_payload(base64_payload: str) -> bytes:
-    """Decode a base64-encoded Twilio mulaw payload."""
+    """Decode a base64-encoded mulaw payload."""
     return base64.b64decode(base64_payload)
+
+decode_signalwire_payload = decode_twilio_payload
 
 
 def twilio_to_deepgram(base64_payload: str) -> bytes:
     """
     Full incoming pipeline:
-    Twilio base64 mulaw → Deepgram linear16 PCM
+    base64 mulaw → Deepgram linear16 PCM
 
     Args:
-        base64_payload: Base64-encoded 8kHz mulaw audio from Twilio
+        base64_payload: Base64-encoded 8kHz mulaw audio
 
     Returns:
         16kHz linear16 PCM audio ready for Deepgram
@@ -73,9 +75,11 @@ def twilio_to_deepgram(base64_payload: str) -> bytes:
     linear16_16k = mulaw_to_linear16(mulaw_bytes)
     return linear16_16k
 
+signalwire_to_deepgram = twilio_to_deepgram
+
 
 # ─────────────────────────────────────────────
-# OUTGOING: Cartesia → Twilio
+# OUTGOING: Cartesia → SignalWire / Twilio
 # ─────────────────────────────────────────────
 
 def linear16_to_mulaw(linear16_16k: bytes) -> bytes:
@@ -105,24 +109,22 @@ def linear16_to_mulaw(linear16_16k: bytes) -> bytes:
 
 
 def encode_twilio_payload(mulaw_bytes: bytes) -> str:
-    """Encode mulaw audio to base64 for Twilio."""
+    """Encode mulaw audio to base64 for stream payload."""
     return base64.b64encode(mulaw_bytes).decode("utf-8")
+
+encode_signalwire_payload = encode_twilio_payload
 
 
 def cartesia_to_twilio(linear16_16k: bytes) -> str:
     """
     Full outgoing pipeline:
-    Cartesia linear16 PCM → Twilio base64 mulaw
-
-    Args:
-        linear16_16k: 16kHz linear16 PCM audio from Cartesia
-
-    Returns:
-        Base64-encoded 8kHz mulaw audio for Twilio
+    Cartesia linear16 PCM → base64 mulaw
     """
     mulaw = linear16_to_mulaw(linear16_16k)
     base64_payload = encode_twilio_payload(mulaw)
     return base64_payload
+
+cartesia_to_signalwire = cartesia_to_twilio
 
 
 # ─────────────────────────────────────────────

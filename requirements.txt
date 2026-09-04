@@ -2,9 +2,10 @@
 fastapi==0.115.0
 uvicorn==0.30.6
 python-dotenv==1.0.1
-
-# ─── Twilio ───
-twilio==9.3.2
+python-multipart==0.0.32
+# Pinned: deepgram-sdk 3.7 async client passes extra_headers= to websockets.connect(),
+# which was removed in websockets 14. Keep <14 until deepgram-sdk is upgraded.
+websockets==13.1
 
 # ─── Deepgram STT ───
 deepgram-sdk==3.7.0
