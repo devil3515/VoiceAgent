@@ -116,12 +116,6 @@ class DeepgramSTTService:
             interim_results=True,
             endpointing=endpointing_ms,
             vad_events=True,
-            # Raise the bar for what counts as speech so quiet background noise
-            # and residual mic hum don't keep firing speech_final on empty
-            # transcripts. 0.5 (default) is too eager for a noisy room; 0.8
-            # keeps ambient noise out while still catching a normal speaking
-            # voice. Deepgram only accepts 0, 0.5, 1.0, or 0.8/0.9 — 0.8 is safe.
-            options={"vad_tuning": "aggressive"},
         )
         self._is_connected = await self._connection.start(options)
 
