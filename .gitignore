@@ -59,3 +59,8 @@ htmlcov/
 nosetests.xml
 coverage.xml
 *.cover
+
+# Frontend (node + build output)
+**/node_modules/
+frontend/dist/
+frontend/.vite/

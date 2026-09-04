@@ -45,6 +45,10 @@ class DeepgramSTTService:
         self._on_transcript_callback = None
         self._is_connected = False
         self._connection = None
+        # Cached VAD state — used by the "are you there?" check-in to know
+        # whether speech has actually arrived (vs. an empty transport).
+        self.speech_started_at: Optional[float] = None
+        self.last_speech_event: Optional[str] = None
 
     # ─────────────────────────────────────────────
     # CONNECTION LIFECYCLE
@@ -89,6 +93,17 @@ class DeepgramSTTService:
             LiveTranscriptionEvents.Close,
             self._wrap_close_handler(on_close),
         )
+        # VAD events: let us know whether speech is being detected on the wire.
+        # These are pure diagnostics, but they're the only way to discriminate
+        # "browser sent silence" from "Deepgram isn't transcribing".
+        self._connection.on(
+            LiveTranscriptionEvents.SpeechStarted,
+            self._wrap_speech_started_handler(),
+        )
+        self._connection.on(
+            LiveTranscriptionEvents.UtteranceEnd,
+            self._wrap_utterance_end_handler(),
+        )
 
         # Configure transcription options
         options = LiveOptions(
@@ -101,6 +116,12 @@ class DeepgramSTTService:
             interim_results=True,
             endpointing=endpointing_ms,
             vad_events=True,
+            # Raise the bar for what counts as speech so quiet background noise
+            # and residual mic hum don't keep firing speech_final on empty
+            # transcripts. 0.5 (default) is too eager for a noisy room; 0.8
+            # keeps ambient noise out while still catching a normal speaking
+            # voice. Deepgram only accepts 0, 0.5, 1.0, or 0.8/0.9 — 0.8 is safe.
+            options={"vad_tuning": "aggressive"},
         )
         self._is_connected = await self._connection.start(options)
 
@@ -159,18 +180,26 @@ class DeepgramSTTService:
         async def handler(*args, **kwargs):
             try:
                 result = kwargs.get("result") if "result" in kwargs else (args[1] if len(args) > 1 else (args[0] if args else None))
-                if result:
-                    transcript = getattr(getattr(getattr(result, "channel", None), "alternatives", [None])[0], "transcript", "")
-                    is_final = getattr(result, "is_final", False)
-                    speech_final = getattr(result, "speech_final", False)
-
-                    if transcript:
-                        logger.debug(
-                            "stt_transcript",
-                            transcript=transcript,
-                            is_final=is_final,
-                            speech_final=speech_final,
+                # Log every Transcript event the SDK emits, even when the
+                # transcript text is empty — that tells us whether the SDK is
+                # actually dispatching these events at all.
+                if result is not None:
+                    try:
+                        channel = result.channel
+                        alternatives = channel.alternatives if channel else []
+                        transcript = (
+                            alternatives[0].transcript if alternatives else ""
                         )
+                        is_final = getattr(result, "is_final", False)
+                        speech_final = getattr(result, "speech_final", False)
+                    except Exception:
+                        transcript, is_final, speech_final = "<extract-error>", False, False
+                    logger.info(
+                        "stt_transcript_event",
+                        transcript=transcript,
+                        is_final=is_final,
+                        speech_final=speech_final,
+                    )
 
                 if asyncio.iscoroutinefunction(callback):
                     await callback(result)
@@ -178,6 +207,33 @@ class DeepgramSTTService:
                     callback(result)
             except Exception as e:
                 logger.error("stt_callback_error", error=str(e))
+
+        return handler
+
+    def _wrap_speech_started_handler(self) -> Callable:
+        """VAD SpeechStarted — Deepgram heard the start of speech on the wire."""
+        import time as _t
+
+        async def handler(*args, **kwargs):
+            try:
+                self.speech_started_at = _t.time()
+                self.last_speech_event = "speech_started"
+                logger.info("stt_speech_started")
+            except Exception as e:
+                logger.error("stt_speech_started_handler_error", error=str(e))
+
+        return handler
+
+    def _wrap_utterance_end_handler(self) -> Callable:
+        """VAD UtteranceEnd — Deepgram closed the utterance window."""
+        import time as _t
+
+        async def handler(*args, **kwargs):
+            try:
+                self.last_speech_event = "utterance_end"
+                logger.info("stt_utterance_end")
+            except Exception as e:
+                logger.error("stt_utterance_end_handler_error", error=str(e))
 
         return handler
 

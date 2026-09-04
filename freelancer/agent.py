@@ -5,19 +5,13 @@ Same audio pipeline as clinic agent, different prompts + tools.
 """
 
 import asyncio
-import json
 import time
 from typing import Optional
 
 from services.deepgram_stt import DeepgramSTTService
-from services.bedrock_llm import BedrockLLMService
+from services.llm import LLMService
 from services.cartesia_tts import CartesiaTTSService
-from services.audio_utils import (
-    twilio_to_deepgram,
-    linear16_to_mulaw,
-    chunk_audio,
-    encode_twilio_payload,
-)
+from services.audio_transport import AudioTransport
 from freelancer.profile import FreelancerProfile
 from freelancer.prompts import build_freelancer_prompt, GREETING_TEMPLATE, WRAP_UP
 from freelancer.tools import get_freelancer_tool_definitions, get_freelancer_tool_map
@@ -34,19 +28,19 @@ class FreelancerVoiceAgent:
     Voice agent for outbound calls on behalf of a freelancer.
 
     Usage:
-        agent = FreelancerVoiceAgent(twilio_ws=ws, profile=profile)
+        agent = FreelancerVoiceAgent(transport=transport, profile=profile, lead_info=lead_info)
         await agent.run()
     """
 
-    def __init__(self, twilio_ws, profile: FreelancerProfile, lead_info: Optional[dict] = None):
-        self.twilio_ws = twilio_ws
+    def __init__(self, transport: AudioTransport, profile: FreelancerProfile, lead_info: Optional[dict] = None):
+        self.transport = transport
         self.profile = profile
         self.lead_info = lead_info or {}
         self.stream_sid: Optional[str] = None
         self.call_sid: Optional[str] = None
 
         self.stt: Optional[DeepgramSTTService] = None
-        self.llm: Optional[BedrockLLMService] = None
+        self.llm: Optional[LLMService] = None
         self.tts: Optional[CartesiaTTSService] = None
 
         # Build prompt from profile
@@ -84,7 +78,7 @@ class FreelancerVoiceAgent:
 
         try:
             self._init_services()
-            self.session = SessionManager(call_sid="pending")
+            self.session = SessionManager(call_id=self.lead_info.get("id", "local") if self.lead_info else "local")
 
             connected = await self.stt.connect(
                 on_transcript=self._on_transcript,
@@ -99,16 +93,10 @@ class FreelancerVoiceAgent:
 
             await self._send_greeting()
 
-            async for raw_message in self.twilio_ws.iter_text():
+            async for frame in self.transport.receive_frames():
                 if self.call_ended:
                     break
-                try:
-                    data = json.loads(raw_message)
-                    await self._handle_twilio_event(data)
-                except json.JSONDecodeError:
-                    pass
-                except Exception as e:
-                    logger.error("freelancer_agent_message_error", error=str(e))
+                await self._process_incoming_audio(frame)
 
         except Exception as e:
             logger.error("freelancer_agent_call_error", error=str(e))
@@ -121,10 +109,10 @@ class FreelancerVoiceAgent:
 
     def _init_services(self):
         self.stt = DeepgramSTTService(api_key=config.deepgram_api_key)
-        self.llm = BedrockLLMService(
-            base_url=config.bedrock_base_url,
-            api_key=config.bedrock_api_key,
-            model_id=config.bedrock_model_id,
+        self.llm = LLMService(
+            base_url=config.llm_base_url,
+            api_key=config.llm_api_key,
+            model_id=config.llm_model_id,
             max_tokens=config.llm_max_tokens,
             temperature=config.llm_temperature,
         )
@@ -134,27 +122,11 @@ class FreelancerVoiceAgent:
         )
 
     # ─────────────────────────────────────────────
-    # TWILIO EVENTS
+    # AUDIO PROCESSING
     # ─────────────────────────────────────────────
 
-    async def _handle_twilio_event(self, data: dict):
-        event = data.get("event")
-        if event == "connected":
-            logger.info("freelancer_twilio_connected")
-        elif event == "start":
-            self.stream_sid = data["start"]["streamSid"]
-            self.call_sid = data["start"].get("callSid", "unknown")
-            if self.session:
-                self.session.call_id = self.call_sid
-            logger.info("freelancer_call_started", call_sid=self.call_sid)
-        elif event == "media":
-            await self._process_incoming_audio(data["media"]["payload"])
-        elif event == "stop":
-            logger.info("freelancer_call_stopped", call_sid=self.call_sid)
-
-    async def _process_incoming_audio(self, base64_mulaw: str):
+    async def _process_incoming_audio(self, pcm_16k: bytes):
         try:
-            pcm_16k = twilio_to_deepgram(base64_mulaw)
             if self.stt and self.stt.is_connected:
                 await self.stt.send_audio(pcm_16k)
         except Exception as e:
@@ -275,32 +247,18 @@ class FreelancerVoiceAgent:
     async def _speak(self, text: str):
         try:
             audio_data = await self.tts.synthesize(text)
-            await self._send_audio_to_twilio(audio_data)
+            await self._send_audio(audio_data)
         except Exception as e:
             logger.error("freelancer_speak_error", error=str(e))
 
-    async def _send_audio_to_twilio(self, pcm_16k: bytes):
-        mulaw_audio = linear16_to_mulaw(pcm_16k)
-        chunks = chunk_audio(mulaw_audio, chunk_size=800)
+    async def _send_audio(self, pcm_16k: bytes):
         self.is_agent_speaking = True
-
-        for chunk in chunks:
-            if not self.is_agent_speaking:
-                break
-            payload = encode_twilio_payload(chunk)
-            message = {
-                "event": "media",
-                "streamSid": self.stream_sid,
-                "media": {"payload": payload},
-            }
-            try:
-                await self.twilio_ws.send_text(json.dumps(message))
-            except Exception as e:
-                logger.error("freelancer_audio_send_error", error=str(e))
-                break
-            await asyncio.sleep(0.02)
-
-        self.is_agent_speaking = False
+        try:
+            await self.transport.send(pcm_16k)
+        except Exception as e:
+            logger.error("freelancer_audio_send_error", error=str(e))
+        finally:
+            self.is_agent_speaking = False
 
     async def _send_greeting(self):
         greeting = GREETING_TEMPLATE.format(name=self.profile.name)

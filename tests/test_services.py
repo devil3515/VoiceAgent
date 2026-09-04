@@ -36,8 +36,8 @@ async def test_config():
 
     print(f"  ✅ Twilio: {config.twilio_account_sid[:8]}...")
     print(f"  ✅ Deepgram: {config.deepgram_api_key[:8]}...")
-    print(f"  ✅ Bedrock Mantle: {config.bedrock_base_url}")
-    print(f"  ✅ Bedrock Model: {config.bedrock_model_id}")
+    print(f"  ✅ LLM endpoint: {config.llm_base_url}")
+    print(f"  ✅ LLM Model: {config.llm_model_id}")
     print(f"  ✅ Cartesia: {config.cartesia_api_key[:8]}...")
     return True
 
@@ -74,18 +74,18 @@ async def test_deepgram():
         return False
 
 
-async def test_bedrock_mantle():
-    """Test Bedrock Mantle LLM (OpenAI-compatible)."""
+async def test_llm():
+    """Test LLM service (OpenAI-compatible)."""
     print("\n" + "=" * 50)
-    print("TEST 3: Bedrock Mantle LLM")
+    print("TEST 3: LLM Service")
     print("=" * 50)
 
-    from services.bedrock_llm import BedrockLLMService
+    from services.llm import LLMService
 
-    llm = BedrockLLMService(
-        base_url=config.bedrock_base_url,
-        api_key=config.bedrock_api_key,
-        model_id=config.bedrock_model_id,
+    llm = LLMService(
+        base_url=config.llm_base_url,
+        api_key=config.llm_api_key,
+        model_id=config.llm_model_id,
     )
 
     try:
@@ -99,7 +99,7 @@ async def test_bedrock_mantle():
         print(f"  🤖 Agent: {response}")
 
         if response:
-            print("  ✅ Bedrock Mantle LLM working")
+            print("  ✅ LLM service working")
             return True
         else:
             print("  ❌ Empty response")
@@ -110,18 +110,18 @@ async def test_bedrock_mantle():
         return False
 
 
-async def test_bedrock_streaming():
-    """Test Bedrock Mantle LLM streaming."""
+async def test_llm_streaming():
+    """Test LLM service streaming."""
     print("\n" + "=" * 50)
-    print("TEST 4: Bedrock Mantle LLM (Streaming)")
+    print("TEST 4: LLM Service (Streaming)")
     print("=" * 50)
 
-    from services.bedrock_llm import BedrockLLMService
+    from services.llm import LLMService
 
-    llm = BedrockLLMService(
-        base_url=config.bedrock_base_url,
-        api_key=config.bedrock_api_key,
-        model_id=config.bedrock_model_id,
+    llm = LLMService(
+        base_url=config.llm_base_url,
+        api_key=config.llm_api_key,
+        model_id=config.llm_model_id,
     )
 
     try:
@@ -192,16 +192,16 @@ async def test_full_pipeline():
     print("TEST 6: Full Pipeline (simulated)")
     print("=" * 50)
 
-    from services.bedrock_llm import BedrockLLMService
+    from services.llm import LLMService
     from services.cartesia_tts import CartesiaTTSService
     from agents.conversation import ConversationManager
     from agents.prompts import SYSTEM_PROMPT
 
     conv = ConversationManager(system_prompt=SYSTEM_PROMPT)
-    llm = BedrockLLMService(
-        base_url=config.bedrock_base_url,
-        api_key=config.bedrock_api_key,
-        model_id=config.bedrock_model_id,
+    llm = LLMService(
+        base_url=config.llm_base_url,
+        api_key=config.llm_api_key,
+        model_id=config.llm_model_id,
     )
     tts = CartesiaTTSService(
         api_key=config.cartesia_api_key,
@@ -274,8 +274,8 @@ async def main():
     results["config"] = await test_config()
     results["audio_conversion"] = await test_audio_conversion()
     results["deepgram"] = await test_deepgram()
-    results["bedrock_mantle"] = await test_bedrock_mantle()
-    results["bedrock_streaming"] = await test_bedrock_streaming()
+    results["llm"] = await test_llm()
+    results["llm_streaming"] = await test_llm_streaming()
     results["cartesia"] = await test_cartesia()
     results["full_pipeline"] = await test_full_pipeline()
 

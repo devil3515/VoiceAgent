@@ -1,20 +1,27 @@
 """
 FastAPI server — entry point for the voice calling agent.
 
-Phase 2 additions:
-- Outbound call support
-- Knowledge base initialization
+Phase 3: Local browser voice.
+- No phone carrier (Twilio / SignalWire) required.
+- Both agent personas (clinic + freelancer) run over a single WebSocket
+  endpoint, /ws/voice, streaming 16 kHz linear16 PCM directly from/to the
+  browser mic and speakers.
 """
 
+import asyncio
+import json
+import uuid
 from datetime import datetime
 import os
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from twilio.twiml.voice_response import VoiceResponse, Connect
 import uvicorn
 
 from agents.voice_agent import VoiceAgent
 from config import config
+from dashboard_bus import bus
+from services.audio_transport import BrowserAudioTransport
 
 
 from freelancer.profile import get_default_profile
@@ -45,126 +52,88 @@ logger.info("knowledge_base_loaded", num_documents=len(kb.documents))
 # ─── FastAPI App ───
 app = FastAPI(
     title="Voice Calling Agent",
-    version="2.0.0",
-    description="Phase 2 — Smart Agent with Tools",
+    version="3.0.0",
+    description="Local browser voice — no carrier required",
 )
 
-active_calls: dict[str, VoiceAgent] = {}
+# CORS — open the dashboard frontend at http://localhost:5173.
+# Local dev only; tighten allow_origins for any real deployment.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+active_calls: dict[str, object] = {}
 
 
 # ─────────────────────────────────────────────
-# SIGNALWIRE WEBHOOKS
+# WEBSOCKET — LOCAL BROWSER VOICE (unified)
 # ─────────────────────────────────────────────
 
-@app.post("/signalwire/inbound")
-@app.post("/twilio/inbound")
-async def handle_inbound_call(request: Request):
-    """SignalWire calls this webhook when someone calls your number."""
-    logger.info("inbound_call_received")
+@app.websocket("/ws/voice")
+async def handle_voice_stream(websocket: WebSocket):
+    """
+    Unified local voice endpoint.
 
-    response = VoiceResponse()
-    connect = Connect()
-    stream_url = f"wss://{config.server_host}/ws/call"
-    logger.info("connecting_stream", url=stream_url)
+    Query params:
+      - persona: "clinic" (default) | "freelancer"
+      - lead_id: optional lead id (freelancer persona only)
 
-    connect.stream(url=stream_url, name="voice-agent-stream")
-    response.append(connect)
-
-    return HTMLResponse(
-        content=str(response),
-        status_code=200,
-        media_type="application/xml",
-    )
-
-
-@app.post("/signalwire/outbound")
-@app.post("/twilio/outbound")
-async def start_outbound_call(request: Request):
-    """Trigger an outbound call via SignalWire."""
-    to_number = None
-
-    # Support JSON or Form body
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        body = await request.json()
-        to_number = body.get("to_number") or body.get("to")
-    else:
-        try:
-            form_data = await request.form()
-            to_number = form_data.get("to_number") or form_data.get("to")
-        except Exception:
-            pass
-
-    if not to_number:
-        return HTMLResponse(content="Missing to_number", status_code=400)
-
-    to_number = str(to_number).strip()
-
-    client = config.get_signalwire_client()
-
-    try:
-        call = client.calls.create(
-            to=to_number,
-            from_=config.signalwire_phone_number,
-            url=f"https://{config.server_host}/signalwire/outbound-flow",
-        )
-
-        logger.info("outbound_call_initiated", call_sid=call.sid, to=to_number)
-        return HTMLResponse(content=f"Call initiated: {call.sid}")
-    except Exception as e:
-        error_msg = str(e)
-        logger.error("outbound_call_failed", error=error_msg, to=to_number)
-        if "21219" in error_msg or "verified number" in error_msg:
-            return HTMLResponse(
-                content=f"SignalWire Trial Restriction: Destination number '{to_number}' is not verified. Please verify this number in SignalWire Console under Phone Numbers -> Verified Numbers, or upgrade your account.",
-                status_code=400,
-            )
-        return HTMLResponse(content=f"Call failed: {error_msg}", status_code=500)
-
-
-@app.post("/signalwire/outbound-flow")
-@app.post("/twilio/outbound-flow")
-async def handle_outbound_flow(request: Request):
-    """LaML/TwiML for outbound calls."""
-    response = VoiceResponse()
-    connect = Connect()
-    connect.stream(url=f"wss://{config.server_host}/ws/call", name="voice-agent-stream")
-    response.append(connect)
-
-    return HTMLResponse(
-        content=str(response),
-        status_code=200,
-        media_type="application/xml",
-    )
-
-
-# ─────────────────────────────────────────────
-# WEBSOCKET — REAL-TIME AUDIO
-# ─────────────────────────────────────────────
-
-@app.websocket("/ws/call")
-async def handle_call_stream(websocket: WebSocket):
-    """Handle the real-time audio stream from Twilio."""
+    Audio contract: binary WebSocket frames carry 16 kHz linear16 mono PCM in
+    both directions. Text frames are control/event metadata (JSON).
+    """
     await websocket.accept()
-    logger.info("websocket_accepted")
+    persona = (websocket.query_params.get("persona") or "clinic").lower()
+    lead_id = websocket.query_params.get("lead_id")
+    session_id = str(uuid.uuid4())
 
-    agent = VoiceAgent(twilio_ws=websocket)
+    transport = BrowserAudioTransport(websocket)
+    agent = None
 
     try:
+        if persona == "freelancer":
+            from freelancer.agent import FreelancerVoiceAgent
+
+            lead_info = None
+            if lead_id:
+                lead = get_lead_manager().get_lead(lead_id)
+                if lead:
+                    lead_info = lead.dict()
+
+            agent = FreelancerVoiceAgent(
+                transport=transport,
+                profile=_current_freelancer_profile,
+                lead_info=lead_info,
+            )
+        else:
+            agent = VoiceAgent(transport=transport, session_id=session_id)
+
+        active_calls[session_id] = agent
+        bus.publish("call_started", session_id=session_id, persona=persona)
+
+        logger.info("voice_ws_accepted", session_id=session_id, persona=persona)
         await agent.run()
+
     except WebSocketDisconnect:
-        logger.info("websocket_disconnected", call_sid=agent.call_sid)
+        logger.info("voice_ws_disconnected", session_id=session_id)
     except Exception as e:
         logger.error(
-            "websocket_error",
-            call_sid=agent.call_sid,
+            "voice_ws_error",
+            session_id=session_id,
             error=str(e),
             error_type=type(e).__name__,
         )
     finally:
-        if agent.call_sid and agent.call_sid in active_calls:
-            del active_calls[agent.call_sid]
-        logger.info("call_cleaned_up", call_sid=agent.call_sid)
+        if session_id in active_calls:
+            del active_calls[session_id]
+        bus.publish("call_ended", session_id=session_id)
+        logger.info("voice_ws_cleaned_up", session_id=session_id)
 
 
 # ─────────────────────────────────────────────
@@ -201,9 +170,8 @@ async def health_check():
         "active_calls": len(active_calls),
         "phase": 2,
         "config": {
-            "signalwire": bool(config.signalwire_project_id),
             "deepgram": bool(config.deepgram_api_key),
-            "bedrock": bool(config.bedrock_base_url),
+            "llm": bool(config.llm_base_url),
             "cartesia": bool(config.cartesia_api_key),
         },
         "tools": ["lookup_pricing", "check_availability", "book_appointment", "search_knowledge", "transfer_call"],
@@ -220,11 +188,44 @@ async def root():
         "service": "Voice Calling Agent",
         "version": "2.0.0",
         "phase": "2 — Smart Agent with Tools",
-        "model": config.bedrock_model_id,
+        "model": config.llm_model_id,
         "health": "/health",
-        "webhook": "/signalwire/inbound",
+        "voice_ws": "/ws/voice?persona=clinic",
         "knowledge_search": "/knowledge/search?q=your+query",
     }
+
+
+# ─────────────────────────────────────────────
+# DASHBOARD EVENT STREAM
+# ─────────────────────────────────────────────
+
+@app.websocket("/ws/dashboard")
+async def dashboard_stream(websocket: WebSocket):
+    """Stream dashboard events (mirrored from structlog) to the SPA."""
+    await websocket.accept()
+    queue = bus.subscribe()
+    logger.info("dashboard_ws_connected")
+    try:
+        # Send a hello so the client knows the connection is live.
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "event": "_connected",
+                    "level": "info",
+                }
+            )
+        )
+        while True:
+            payload = await queue.get()
+            await websocket.send_text(json.dumps(payload, default=str))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error("dashboard_ws_error", error=str(e), error_type=type(e).__name__)
+    finally:
+        bus.unsubscribe(queue)
+        logger.info("dashboard_ws_disconnected")
 
 
 # ─────────────────────────────────────────────
@@ -266,68 +267,9 @@ async def list_freelancer_leads():
     return {"leads": [l.dict() for l in lm.get_all_leads()]}
 
 
-@app.post("/freelancer/call/{lead_id}")
-async def call_freelancer_lead(lead_id: str):
-    """Trigger an outbound call to a lead via SignalWire."""
-    lm = get_lead_manager()
-    lead = lm.get_lead(lead_id)
-    if not lead:
-        return HTMLResponse(content="Lead not found", status_code=404)
-
-    try:
-        client = config.get_signalwire_client()
-        to_phone = lead.phone.strip()
-        call = client.calls.create(
-            to=to_phone,
-            from_=config.signalwire_phone_number,
-            url=f"https://{config.server_host}/freelancer/outbound-flow",
-        )
-        lm.update_lead_status(lead_id, "called", called_at=datetime.now().isoformat())
-        logger.info("freelancer_outbound_call", lead_id=lead_id, call_sid=call.sid)
-        return {"status": "calling", "call_sid": call.sid, "to": lead.phone}
-    except Exception as e:
-        logger.error("freelancer_outbound_error", error=str(e))
-        return HTMLResponse(content=str(e), status_code=500)
-
-
-# ─────────────────────────────────────────────
-# FREELANCER OUTBOUND FLOW
-# ─────────────────────────────────────────────
-
-@app.post("/freelancer/outbound-flow")
-async def freelancer_outbound_flow(request: Request):
-    """TwiML for freelancer outbound calls."""
-    response = VoiceResponse()
-    connect = Connect()
-    connect.stream(
-        url=f"wss://{config.server_host}/ws/freelancer-call",
-        name="freelancer-agent-stream",
-    )
-    response.append(connect)
-    return HTMLResponse(content=str(response), status_code=200, media_type="application/xml")
-
-
-@app.websocket("/ws/freelancer-call")
-async def handle_freelancer_call_stream(websocket: WebSocket):
-    """WebSocket for freelancer outbound calls."""
-    await websocket.accept()
-    logger.info("freelancer_websocket_accepted")
-
-    from freelancer.agent import FreelancerVoiceAgent
-
-    agent = FreelancerVoiceAgent(
-        twilio_ws=websocket,
-        profile=_current_freelancer_profile,
-    )
-
-    try:
-        await agent.run()
-    except WebSocketDisconnect:
-        logger.info("freelancer_websocket_disconnected")
-    except Exception as e:
-        logger.error("freelancer_websocket_error", error=str(e))
-    finally:
-        logger.info("freelancer_call_cleaned_up")
+# NOTE: Freelancer calling is live-talk-only via /ws/voice?persona=freelancer.
+# The legacy outbound-call + outbound-flow routes (which required a Twilio/
+# SignalWire account) have been removed.
 
 
 # ─────────────────────────────────────────────
@@ -339,15 +281,15 @@ if __name__ == "__main__":
         "server_starting",
         port=config.port,
         server_host=config.server_host,
-        model=config.bedrock_model_id,
+        model=config.llm_model_id,
     )
-    print(f"\n🚀 Voice Agent Server Starting (Phase 2)")
+    print(f"\n🚀 Voice Agent Server Starting (Phase 3 — Local Browser Voice)")
     print(f"   Port: {config.port}")
-    print(f"   Model: {config.bedrock_model_id}")
+    print(f"   Model: {config.llm_model_id}")
     print(f"   Tools: lookup_pricing, check_availability, book_appointment, search_knowledge, transfer_call")
     print(f"   Knowledge Base: {len(get_knowledge_base().documents)} documents")
     print(f"   Health: http://localhost:{config.port}/health")
-    print(f"   Webhook: https://{config.server_host}/signalwire/inbound")
+    print(f"   Voice WS: ws://localhost:{config.port}/ws/voice?persona=clinic")
     print()
 
     uvicorn.run(
